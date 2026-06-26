@@ -314,41 +314,12 @@ def print_plan(plan_groups, summary, mode):
 
 
 def execute(lib, plan_groups, dup_root):
-    """Perform the merge and append to the quarantine manifest. Returns its path."""
-    manifest_rows = []
-    for g in plan_groups:
-        survivor = g["survivor"]["id"]
-        dup_info = {d["id"]: d for d in g["duplicates"]}
-
-        # Copy formats onto the survivor before anything is removed.
-        for fa in g["format_actions"]:
-            src = lib.format_abspath(fa["from_id"], fa["fmt"])
-            if src:
-                lib.add_format(survivor, fa["fmt"], src, replace=True, run_hooks=False)
-
-        for field, val in g["set_ops"].items():
-            lib.set_field(field, {survivor: val})
-
-        # Quarantine each duplicate's folder, then remove the records. Files are
-        # copied first so the library removal can be permanent (the copy is the
-        # backup) without relying on an OS recycle bin.
-        for q in g["quarantine"]:
-            if q["src"] and q["dest"] and os.path.isdir(q["src"]):
-                os.makedirs(os.path.dirname(q["dest"]), exist_ok=True)
-                shutil.copytree(q["src"], q["dest"], dirs_exist_ok=True)
-            info = dup_info.get(q["id"], {})
-            manifest_rows.append([
-                info.get("title", ""), info.get("authors", ""),
-                q["id"], survivor, q["src"] or "", q["dest"] or "",
-            ])
-
-        if g["delete"]:
-            lib.remove_books(set(g["delete"]), permanent=True)
-
-    if not manifest_rows:
+    """Perform the merge, appending to the quarantine manifest as each group
+    completes so the audit trail survives an interrupted run. Returns the
+    manifest path, or None if there was nothing to remove."""
+    if not any(g["delete"] for g in plan_groups):
         return None
 
-    # Append to the quarantine manifest so removals stay auditable across runs.
     os.makedirs(dup_root, exist_ok=True)
     manifest = os.path.join(dup_root, "quarantine_manifest.csv")
     is_new = not os.path.exists(manifest)
@@ -357,7 +328,44 @@ def execute(lib, plan_groups, dup_root):
         if is_new:
             w.writerow(["title", "author", "calibre_id", "survivor_id",
                         "original_path", "new_path"])
-        w.writerows(manifest_rows)
+            f.flush()
+
+        for g in plan_groups:
+            survivor = g["survivor"]["id"]
+            dup_info = {d["id"]: d for d in g["duplicates"]}
+
+            # Copy formats onto the survivor before anything is removed.
+            for fa in g["format_actions"]:
+                src = lib.format_abspath(fa["from_id"], fa["fmt"])
+                if src:
+                    lib.add_format(survivor, fa["fmt"], src, replace=True, run_hooks=False)
+
+            for field, val in g["set_ops"].items():
+                lib.set_field(field, {survivor: val})
+
+            # Quarantine each duplicate's folder (the copy is the backup that
+            # makes the library removal safe to do permanently).
+            rows = []
+            for q in g["quarantine"]:
+                if q["src"] and q["dest"] and os.path.isdir(q["src"]):
+                    os.makedirs(os.path.dirname(q["dest"]), exist_ok=True)
+                    shutil.copytree(q["src"], q["dest"], dirs_exist_ok=True)
+                info = dup_info.get(q["id"], {})
+                rows.append([
+                    info.get("title", ""), info.get("authors", ""),
+                    q["id"], survivor, q["src"] or "", q["dest"] or "",
+                ])
+
+            # Record the quarantine and flush BEFORE removing the records, so an
+            # interrupted run can never delete books without logging where their
+            # backups went.
+            if rows:
+                w.writerows(rows)
+                f.flush()
+
+            if g["delete"]:
+                lib.remove_books(set(g["delete"]), permanent=True)
+
     return manifest
 
 
