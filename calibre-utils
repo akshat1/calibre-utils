@@ -1,0 +1,6 @@
+#!/bin/sh
+# Launcher for the calibre-utils CLI. The real entry point is src/cli.py, run
+# inside Calibre's bundled Python via calibre-debug. The `--` keeps our own
+# arguments away from calibre-debug's option parser.
+self=$(readlink -f -- "$0")
+exec calibre-debug "$(dirname -- "$self")/src/cli.py" -- "$@"
