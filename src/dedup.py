@@ -87,13 +87,21 @@ def parse_args(argv=None, prog="calibre-dedup"):
 
 
 def norm(s):
-    """Case-, accent- and punctuation-insensitive normalization for matching."""
+    """Normalize a string for matching: fold case and accents and drop
+    punctuation/symbols, but KEEP letters and digits of every script.
+
+    The previous version stripped everything outside ``[a-z0-9]``, which erased
+    titles/authors written entirely in non-Latin scripts (Devanagari, Urdu, …)
+    to the empty string — collapsing every such book into one bogus duplicate
+    group. Here we keep any Unicode letter/mark/number and replace the rest with
+    spaces, so distinct non-Latin titles stay distinct."""
     if not s:
         return ""
     s = unicodedata.normalize("NFKD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
     s = s.lower()
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = "".join(c if (c.isspace() or unicodedata.category(c)[0] in "LMN") else " "
+                for c in s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -155,10 +163,19 @@ def book_dir(lib, library_path, bid):
 
 def build_plan(lib, library_path, dup_root, book_ids):
     groups = {}
+    skipped = []
     for bid in book_ids:
         title = lib.field_for("title", bid) or ""
         authors = list(lib.field_for("authors", bid) or ())
-        key = norm(title_sort(title)) + " | " + norm(authors_to_sort_string(authors))
+        title_key = norm(title_sort(title))
+        author_key = norm(authors_to_sort_string(authors))
+        # Never group a book whose title AND author yield no usable key — that
+        # would lump together unrelated books with empty/symbol-only metadata.
+        # Surface these instead so they can be reviewed by hand.
+        if not title_key and not author_key:
+            skipped.append({"id": bid, "title": title, "authors": " & ".join(authors)})
+            continue
+        key = title_key + " | " + author_key
         groups.setdefault(key, []).append(bid)
 
     plan_groups = []
@@ -263,11 +280,12 @@ def build_plan(lib, library_path, dup_root, book_ids):
                              if fa["action"] == "add"),
         "formats_replaced": sum(1 for g in plan_groups for fa in g["format_actions"]
                                 if fa["action"] == "replace"),
+        "skipped": len(skipped),
     }
-    return plan_groups, summary
+    return plan_groups, summary, skipped
 
 
-def print_plan(plan_groups, summary, mode):
+def print_plan(plan_groups, summary, skipped, mode):
     for g in plan_groups:
         sv = g["survivor"]
         print(f"Group: {sv['title']} — {sv['authors']}")
@@ -306,11 +324,17 @@ def print_plan(plan_groups, summary, mode):
         print(f"  -> {verb} & removed " + ", ".join(f"id={d}" for d in g["delete"]))
         print()
 
+    if skipped:
+        print("Skipped (no usable title/author key — review manually):")
+        for b in skipped:
+            print(f"  id={b['id']}  {b['title']!r} — {b['authors']!r}")
+        print()
+
     s = summary
     removed_word = "removed" if mode == "apply" else "to remove"
     print(f"Summary: {s['groups']} duplicate group(s), {s['books_deleted']} book(s) "
           f"{removed_word}, {s['formats_added']} format(s) added, "
-          f"{s['formats_replaced']} replaced.")
+          f"{s['formats_replaced']} replaced, {s['skipped']} skipped.")
 
 
 def execute(lib, plan_groups, dup_root):
@@ -382,14 +406,15 @@ def main(argv=None, prog="calibre-dedup"):
     if args.limit:
         book_ids = book_ids[:args.limit]
 
-    plan_groups, summary = build_plan(lib, library_path, dup_root, book_ids)
-    print(f"Scanned {len(book_ids)} books, found {len(plan_groups)} duplicate group(s).\n")
-    if not plan_groups:
+    plan_groups, summary, skipped = build_plan(lib, library_path, dup_root, book_ids)
+    print(f"Scanned {len(book_ids)} books, found {len(plan_groups)} duplicate "
+          f"group(s); {len(skipped)} skipped.\n")
+    if not plan_groups and not skipped:
         print("No duplicates found — nothing to do.")
         return
 
     mode = "apply" if args.apply else "plan"
-    print_plan(plan_groups, summary, mode)
+    print_plan(plan_groups, summary, skipped, mode)
 
     if args.apply:
         manifest = execute(lib, plan_groups, dup_root)
